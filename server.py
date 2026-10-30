@@ -17,6 +17,7 @@ mcp = FastMCP("rag-app")
 
 es_client = Elasticsearch(hosts=os.getenv("es_host"))
 es_index = os.getenv("es_index")
+cache_index = os.getenv("es_cache_index")
 openai_client = OpenAI(base_url=os.getenv("base_url"), api_key=os.getenv("api_key"))
 embedding_model = os.getenv("embedding_model")
 
@@ -72,6 +73,15 @@ def hybrid_search(request_data: SearchRequest) -> list[dict]:
         for hit in response["hits"]["hits"]
     ]
 
-
+@mcp.tool()
+def clear_cache_index():
+    """Clear the Elasticsearch index cache."""
+    query_body = {
+        "query": {
+            "match_all": {}
+        }
+    }
+    es_client.delete_by_query(index=cache_index, body=query_body)
+    return {"message": "Cache cleared."}
 if __name__ == "__main__":
     mcp.run()
