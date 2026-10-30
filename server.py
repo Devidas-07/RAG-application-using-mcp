@@ -6,6 +6,7 @@ from fastmcp import FastMCP
 from elasticsearch import Elasticsearch
 from openai import OpenAI
 from pydantic import BaseModel
+import math
 
 os.environ["TQDM_DISABLE"] = "1"
 load_dotenv()
@@ -35,43 +36,72 @@ def hybrid_search(request_data: SearchRequest) -> list[dict]:
         input=request_data.query,
         encoding_format="float",
     )
-    response = es_client.search(
+    knn_query = query_embedding.data[0].embedding
+    
+
+    K = request_data.rank_constant if hasattr(request_data, "rank_constant") else 60
+    WINDOW = 50
+
+    # ---- 1. Keyword / BM25 retriever (standard query) ----
+    kw_response = es_client.search(
         index=es_index,
-        body={
-            "size": request_data.k,
-            "query": {
-                "bool": {
-                    "should": [{
-                        "multi_match": {
-                            "query": request_data.query,
-                            "fields": ["title", "body", "description", "created_by"],
-                            "fuzziness": "AUTO",
-                            "boost": 1.0,
-                        }
-                    }],
-                    "minimum_should_match": 0,
-                }
-            },
-            "knn": {
-                "field": "embedding_field",
-                "query_vector": query_embedding.data[0].embedding,
-                "k": request_data.k,
-                "num_candidates": 100,
-                "boost": 2.0,
-            },
+        size=WINDOW,
+        query={
+            "bool": {
+                "should": [
+                    { "term":  { "title": { "value": request_data.query, "boost": 10.0 } } },
+                    { "match": { "title": { "query": request_data.query, "boost": 5.0 } } },
+                    { "match": { "body":  { "query": request_data.query, "boost": 3.0 } } },
+                    { "match": { "description": { "query": request_data.query, "boost": 2.0 } } },
+                ]
+            }
         },
     )
+
+    # ---- 2. kNN / vector retriever ----
+    knn_response = es_client.search(
+        index=es_index,
+        size=WINDOW,
+        knn={
+            "field": "embedding_field",
+            "query_vector": knn_query,
+            "k": 50,
+            "num_candidates": 100,
+        },
+    )
+
+
+
+    fused = {}
+    docs = {}
+    for response in (kw_response, knn_response):
+        for doc_id, score in rrf_scores(response).items():
+            fused[doc_id] = fused.get(doc_id, 0.0) + score
+        for hit in response["hits"]["hits"]:
+            docs.setdefault(doc_id := hit["_id"], hit["_source"]) if False else docs.__setitem__(doc_id, hit) if False else None
+            docs[hit["_id"]] = hit
+
+    # Order by combined score desc, limit to rank_window_size
+    ranked_ids = sorted(fused, key=lambda d: fused[d], reverse=True)[:WINDOW]
+
     return [
         {
-            "id": hit["_id"],
-            "title": hit["_source"].get("title", ""),
-            "description": hit["_source"].get("description", ""),
-            "body": hit["_source"].get("body", ""),
-            "created_by": hit["_source"].get("created_by", ""),
-            "score": hit["_score"],
+            "id": doc_id,
+            "title": docs[doc_id]["_source"].get("title", ""),
+            "description": docs[doc_id]["_source"].get("description", ""),
+            "body": docs[doc_id]["_source"].get("body", ""),
+            "created_by": docs[doc_id]["_source"].get("created_by", ""),
+            "score": fused[doc_id],  # combined RRF score, same formula as native
         }
-        for hit in response["hits"]["hits"]
+        for doc_id in ranked_ids
     ]
+# ---- 3. Reciprocal Rank Fusion (same formula as ES native RRF) ----
+def rrf_scores(response):
+    """Map doc_id -> 1 / (rank_constant + rank), rank starting at 1."""
+    out = {}
+    for rank, hit in enumerate(response["hits"]["hits"], start=1):
+        out[hit["_id"]] = 1.0 / (60 + rank)
+    return out
 
 @mcp.tool()
 def clear_cache_index():
