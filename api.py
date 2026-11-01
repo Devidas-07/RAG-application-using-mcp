@@ -1,3 +1,5 @@
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 import asyncio
 import json
 import os
@@ -15,7 +17,6 @@ from pydantic import BaseModel
 import mcp_client
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -67,16 +68,6 @@ is_harmful_question = {
         ),
     }
 }
-tool_selector_question = {
-    "tool_to_call": {
-        "type": "classification",
-        "instructions": (
-            "Given the user query and available tools, return the name of the "
-            "single most appropriate tool to call. Return only the tool name."
-        ),
-    }
-}
-
 
 # ── Plain helper functions ────────────────────────────────────────────────────
 def check_cache(query: str) -> dict | None:
@@ -116,23 +107,41 @@ def is_harmful_input(query: str) -> bool:
 def select_tool(query: str, tools: list[dict]) -> str:
     if not tools:
         raise ValueError("No tools available from MCP server")
-    if router is None or len(tools) == 1:
-        logger.info("[TOOL SELECT] Only one tool available, using: %s", tools[0]["name"])
+    if len(tools) == 1:
+        logger.info("[TOOL SELECT] Only one tool, using: %s", tools[0]["name"])
         return tools[0]["name"]
-    tool_descriptions = "\n".join(f"- {t['name']}: {t.get('description', '')}" for t in tools)
-    try:
-        result = router.predict(
-            state={"user_query": query[:MAX_QUERY_CHARS], "available_tools": tool_descriptions},
-            questions=tool_selector_question,
-        )
-        chosen = result.get("answers", {}).get("tool_to_call", {}).get("label", "")
-        names = [t["name"] for t in tools]
-        chosen = chosen if chosen in names else tools[0]["name"]
-        logger.info("[TOOL SELECT] Laya chose: %s", chosen)
-        return chosen
-    except Exception:
-        logger.exception("[TOOL SELECT] Failed, using first tool")
+
+    if router is None:
+        logger.info("[TOOL SELECT] Router unavailable, using first tool")
         return tools[0]["name"]
+
+    scores = {}
+    for tool in tools:
+        question = {
+            "is_correct_tool": {
+                "type": "noul",
+                "instructions": (
+                    f"Given the user query, should we call the tool '{tool['name']}'? "
+                    f"Tool description: {tool.get('description', '')}. "
+                    "Return true if this is the most appropriate tool for the query."
+                ),
+            }
+        }
+        try:
+            result = router.predict(
+                state={"user_query": query[:MAX_QUERY_CHARS]},
+                questions=question,
+            )
+            score = result.get("answers", {}).get("is_correct_tool", {}).get("noul", 0.0)
+            scores[tool["name"]] = score
+            logger.info("[TOOL SELECT] tool=%s score=%.3f", tool["name"], score)
+        except Exception:
+            logger.exception("[TOOL SELECT] Scoring failed for tool %s", tool["name"])
+            scores[tool["name"]] = 0.0
+
+    chosen = max(scores, key=scores.get)
+    logger.info("[TOOL SELECT] Scores: %s -> chose: %s", scores, chosen)
+    return chosen
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -143,7 +152,9 @@ class QueryRequest(BaseModel):
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-
+@app.get("/")
+def get_health():
+    return {"status":"health is ok.."}
 @app.post("/ask")
 async def ask(request: QueryRequest):
     query = request.query
@@ -188,12 +199,29 @@ async def ask(request: QueryRequest):
 
             # Step 4 — call MCP tool on persistent session
             logger.info("[STEP 4] Calling MCP tool: %s...", tool_name)
-            tool_result = await mcp_client.call_tool(
-                tool_name, {"request_data": {"query": query, "k": 5}}
-            )
+            tool_schema = next((t["schema"] for t in tools if t["name"] == tool_name), {})
+            required = tool_schema.get("required", [])
+            properties = tool_schema.get("properties", {})
+            # build arguments only for params the tool actually declares
+            arguments = {}
+            if "request_data" in properties:
+                arguments["request_data"] = {"query": query, "k": 5}
+            elif "query" in properties:
+                arguments["query"] = query
+            # tools with no required params (e.g. clear_cache_index) get empty args
+            logger.info("[STEP 4] Calling with arguments: %s", arguments)
+            tool_result = await mcp_client.call_tool(tool_name, arguments)
             search_results = tool_result if isinstance(tool_result, list) else []
-            logger.info("[STEP 4] Tool returned %d results (%.2fs)",
-                        len(search_results), (datetime.now() - start).total_seconds())
+            logger.info("[STEP 4] Tool returned: %s (%.2fs)",
+                        f"{len(search_results)} results" if search_results else tool_result,
+                        (datetime.now() - start).total_seconds())
+
+            # if tool returned no search results (e.g. clear_cache_index), respond directly
+            if not search_results:
+                msg = tool_result if isinstance(tool_result, str) else "Action completed successfully."
+                yield sse({"type": "token", "content": msg})
+                yield sse({"type": "done"})
+                return
 
             sources = [{"id": r.get("id"), "title": r.get("title", "")} for r in search_results]
             yield sse({"type": "sources", "sources": sources})

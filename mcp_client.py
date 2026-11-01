@@ -64,13 +64,17 @@ async def call_tool(tool_name: str, arguments: dict):
             obj = json.loads(part)
             parsed.extend(obj) if isinstance(obj, list) else parsed.append(obj)
         except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            idx = 0
-            while idx < len(part):
-                part = part[idx:].lstrip()
-                if not part:
-                    break
-                obj, end = decoder.raw_decode(part)
-                parsed.append(obj)
-                idx = end
+            try:
+                decoder = json.JSONDecoder()
+                idx = 0
+                while idx < len(part):
+                    part = part[idx:].lstrip()
+                    if not part:
+                        break
+                    obj, end = decoder.raw_decode(part)
+                    parsed.append(obj)
+                    idx = end
+            except json.JSONDecodeError:
+                # plain string response (e.g. "done", "ok") — return as-is
+                parsed.append(part)
     return parsed if len(parsed) != 1 else parsed[0]
